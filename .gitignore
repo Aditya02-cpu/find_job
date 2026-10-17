@@ -8,3 +8,5 @@ dist/
 build/
 .venv/
 venv/
+config.json=crew_ml.py
+
