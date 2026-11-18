@@ -1,23 +1,67 @@
 """
 CrewAI Agent definitions for the Multi-Agent Job Application Assistant.
 
-Three specialized agents collaborate in a sequential pipeline:
+Four specialized agents collaborate:
   1. Job Analyzer Agent — extracts key requirements from job listings.
   2. Resume Customizer Agent — tailors resume and cover letter to the job.
   3. LinkedIn Outreach Agent — drafts personalized outreach messages.
+  4. Resume Reviewer Agent — audits resumes and gives actionable improvement advice.
 """
+
+from threading import Lock
 
 from crewai import Agent, LLM
 from config import Config
 
+_shared_llm: LLM | None = None
+_llm_lock = Lock()
+
 
 def _get_llm() -> LLM:
-    """Create a shared Gemini LLM instance for all agents."""
-    return LLM(
-        model=Config.GEMINI_MODEL,
-        temperature=0.7,
-        api_key=Config.GEMINI_API_KEY,
-    )
+    """Create/reuse a shared Gemini LLM instance for all agents to reduce startup overhead."""
+    global _shared_llm
+    if _shared_llm is not None:
+        return _shared_llm
+
+    with _llm_lock:
+        if _shared_llm is not None:
+            return _shared_llm
+
+        kwargs = {
+            "model": Config.GEMINI_MODEL,
+            "temperature": 0.7,
+            "api_key": Config.GEMINI_API_KEY,
+        }
+
+        # Gemini 2.5+ auto-enables "thinking" in newer CrewAI providers, which can slow responses.
+        # Disable/minimize it by default for this pipeline (configurable via env vars).
+        model_lower = (Config.GEMINI_MODEL or "").lower()
+        if "gemini" in model_lower:
+            try:
+                from google.genai import types
+
+                budget = max(int(getattr(Config, "GEMINI_THINKING_BUDGET", 0)), 0)
+                include_thoughts = bool(getattr(Config, "GEMINI_INCLUDE_THOUGHTS", False))
+                # Pass via both names for provider compatibility.
+                thinking_cfg = types.ThinkingConfig(
+                    thinking_budget=budget,
+                    include_thoughts=include_thoughts,
+                )
+                kwargs["thinking_config"] = thinking_cfg
+                kwargs["additional_params"] = {"thinking_config": thinking_cfg}
+            except Exception:
+                # If google-genai types are unavailable, proceed without explicit thinking config.
+                pass
+
+        _shared_llm = LLM(**kwargs)
+        return _shared_llm
+
+
+def reset_shared_llm() -> None:
+    """Reset cached LLM (useful if config/model changes at runtime)."""
+    global _shared_llm
+    with _llm_lock:
+        _shared_llm = None
 
 
 def create_job_analyzer_agent() -> Agent:
@@ -45,8 +89,9 @@ def create_job_analyzer_agent() -> Agent:
             "candidates successfully land their dream positions."
         ),
         llm=_get_llm(),
-        verbose=True,
-        memory=True,
+        verbose=Config.CREW_VERBOSE,
+        memory=Config.AGENT_MEMORY_ENABLED,
+        max_iter=Config.AGENT_MAX_ITER,
         allow_delegation=False,
     )
 
@@ -77,8 +122,9 @@ def create_resume_customizer_agent() -> Agent:
             "modern resume formatting best practices."
         ),
         llm=_get_llm(),
-        verbose=True,
-        memory=True,
+        verbose=Config.CREW_VERBOSE,
+        memory=Config.AGENT_MEMORY_ENABLED,
+        max_iter=Config.AGENT_MAX_ITER,
         allow_delegation=False,
     )
 
@@ -109,7 +155,38 @@ def create_linkedin_outreach_agent() -> Agent:
             "rate because they are genuine, concise, and value-driven."
         ),
         llm=_get_llm(),
-        verbose=True,
-        memory=True,
+        verbose=Config.CREW_VERBOSE,
+        memory=Config.AGENT_MEMORY_ENABLED,
+        max_iter=Config.AGENT_MAX_ITER,
+        allow_delegation=False,
+    )
+
+
+def create_resume_reviewer_agent() -> Agent:
+    """
+    Creates the Resume Reviewer/Auditor agent.
+
+    This agent objectively reviews resumes, scores them, and gives
+    actionable feedback to improve structure, ATS compatibility, and impact.
+    """
+    return Agent(
+        role="ATS Resume Auditor & Career Coach",
+        goal=(
+            "Objectively review a candidate's resume against modern hiring standards. "
+            "Give a balanced scorecard, point out structural/impact issues, "
+            "identify missing ATS keywords, and provide concrete, prioritized fixes "
+            "to make the resume stronger for the target role."
+        ),
+        backstory=(
+            "You are an ex-technical recruiter and certified resume reviewer who has "
+            "screened 10,000+ resumes across private and government roles. You know "
+            "ATS parsing, bullet writing (Action + Impact), federal resume nuances, "
+            "and what actually gets interviews. You are blunt but constructive, "
+            "specific with examples, and focused on high-impact changes first."
+        ),
+        llm=_get_llm(),
+        verbose=Config.CREW_VERBOSE,
+        memory=Config.AGENT_MEMORY_ENABLED,
+        max_iter=Config.AGENT_MAX_ITER,
         allow_delegation=False,
     )

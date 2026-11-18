@@ -1,17 +1,68 @@
 """
 Streamlit Web Application — Multi-Agent Job Application Assistant
 
-A premium, modern UI for searching government jobs, selecting positions,
-and generating AI-powered application materials via CrewAI agents.
+A premium, modern UI for searching jobs (USA & India), selecting positions,
+uploading resumes for AI review, and generating AI-powered application materials via CrewAI agents.
 """
 
 import streamlit as st
 import time
 import traceback
+import io
 from config import Config
 from usajobs_client import USAJobsClient
-from crew import run_job_application_crew
+from indian_jobs_client import IndianJobsClient
+from crew import run_job_application_crew, run_resume_review_crew
 from logger import ApplicationLogger
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    import docx
+except Exception:
+    docx = None
+
+
+def extract_resume_text(uploaded_file):
+    """Extract text from uploaded resume files (PDF, DOCX, TXT, MD)."""
+    if uploaded_file is None:
+        return ""
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith(".pdf"):
+            if PdfReader is None:
+                raise ValueError("pypdf is not installed. Please install pypdf to upload PDFs.")
+            uploaded_file.seek(0)
+            reader = PdfReader(uploaded_file)
+            text_parts = []
+            for page in reader.pages:
+                try:
+                    page_text = page.extract_text() or ""
+                    if page_text:
+                        text_parts.append(page_text)
+                except Exception:
+                    continue
+            return "\n".join(text_parts)
+        elif name.endswith(".docx"):
+            if docx is None:
+                raise ValueError("python-docx is not installed. Please install python-docx to upload DOCX files.")
+            uploaded_file.seek(0)
+            document = docx.Document(uploaded_file)
+            return "\n".join(p.text for p in document.paragraphs)
+        elif name.endswith(".txt") or name.endswith(".md") or name.endswith(".rtf"):
+            uploaded_file.seek(0)
+            data = uploaded_file.read()
+            try:
+                return data.decode("utf-8")
+            except UnicodeError:
+                return data.decode("latin-1", errors="ignore")
+        else:
+            raise ValueError("Unsupported file type. Please upload PDF, DOCX, TXT, or MD files.")
+    except Exception as e:
+        raise e
 
 
 # ─────────────────────────────────────────────────────────
@@ -280,6 +331,14 @@ if "is_running" not in st.session_state:
     st.session_state.is_running = False
 if "page" not in st.session_state:
     st.session_state.page = "search"
+if "resume_review_output" not in st.session_state:
+    st.session_state.resume_review_output = None
+if "resume_uploaded_text" not in st.session_state:
+    st.session_state.resume_uploaded_text = ""
+if "resume_upload_filename" not in st.session_state:
+    st.session_state.resume_upload_filename = ""
+if "job_country" not in st.session_state:
+    st.session_state.job_country = "USA (USAJobs)"
 
 
 # ─────────────────────────────────────────────────────────
@@ -289,11 +348,14 @@ with st.sidebar:
     st.markdown("### 🧭 Navigation")
 
     nav_search = st.button("🔍  Search Jobs", use_container_width=True, key="nav_search")
+    nav_review = st.button("🧾  Resume Review", use_container_width=True, key="nav_review")
     nav_generate = st.button("⚡  Generate Materials", use_container_width=True, key="nav_generate")
     nav_history = st.button("📋  Application History", use_container_width=True, key="nav_history")
 
     if nav_search:
         st.session_state.page = "search"
+    if nav_review:
+        st.session_state.page = "review"
     if nav_generate:
         st.session_state.page = "generate"
     if nav_history:
@@ -301,24 +363,54 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📝 Your Resume")
-    st.caption("Paste your base resume below. This will be used by the AI agents to tailor your application materials.")
+    st.caption("Upload your resume (PDF/DOCX/TXT/MD) or paste below. This will be used by agents for tailoring and review.")
+    
+    uploaded_resume = st.file_uploader(
+        "Upload Resume",
+        type=["pdf", "docx", "txt", "md", "rtf"],
+        key="resume_uploader",
+        help="Upload your resume file to auto-extract text",
+    )
+    
+    if uploaded_resume is not None:
+        try:
+            extracted = extract_resume_text(uploaded_resume)
+            if extracted.strip():
+                st.session_state.resume_uploaded_text = extracted
+                st.session_state.resume_upload_filename = uploaded_resume.name
+                st.success(f"✅ Extracted from {uploaded_resume.name} ({len(extracted)} chars)")
+            else:
+                st.warning("Could not extract text from this file. It might be scanned/image-based.")
+        except Exception as e:
+            st.error(f"❌ Error extracting resume: {str(e)}")
+    
+    resume_text_default = st.session_state.get("resume_uploaded_text", "") or st.session_state.get("user_resume", "")
     user_resume = st.text_area(
         "Resume Content",
+        value=resume_text_default,
         height=250,
         placeholder="Paste your full resume here...\n\nInclude your work experience, skills, education, and any relevant certifications.",
         label_visibility="collapsed",
         key="user_resume",
     )
+    if user_resume:
+        st.session_state.resume_uploaded_text = user_resume
 
     st.markdown("---")
 
     # Config status
     missing = Config.validate()
+    missing_indian = Config.validate_indian()
     if missing:
         st.error(f"⚠️ Missing config: {', '.join(missing)}")
-        st.caption("Create a `.env` file from `.env.example` and fill in your API keys.")
+        st.caption("Create a `.env` file and fill in your API keys.")
     else:
-        st.success("✅ All API keys configured")
+        st.success("✅ Core API keys configured")
+    if missing_indian:
+        provider = Config.INDIAN_JOB_PROVIDER
+        st.warning(f"⚠️ Missing Indian keys for {provider}: {', '.join(missing_indian)}")
+    else:
+        st.caption(f"✅ Indian job API configured ({Config.INDIAN_JOB_PROVIDER})")
 
     st.markdown("---")
     st.markdown(
@@ -370,9 +462,17 @@ st.markdown("""
 # PAGE: Search Jobs
 # ═════════════════════════════════════════════════════════
 if st.session_state.page == "search":
-    st.markdown('<div class="section-header">🔍 Search Government Job Listings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🔍 Search Job Listings</div>', unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([2, 2, 1])
+    col_country, col1, col2, col3 = st.columns([1.2, 2, 2, 1])
+    with col_country:
+        job_country = st.selectbox(
+            "🌍 Country/Source",
+            options=["USA (USAJobs)", "India"],
+            index=0 if st.session_state.get("job_country") == "USA (USAJobs)" else 1,
+            key="job_country_select",
+        )
+        st.session_state.job_country = job_country
     with col1:
         keyword = st.text_input(
             "🔑 Keyword",
@@ -380,11 +480,18 @@ if st.session_state.page == "search":
             key="search_keyword",
         )
     with col2:
-        location = st.text_input(
-            "📍 Location",
-            placeholder="e.g., Washington, DC or Remote",
-            key="search_location",
-        )
+        if job_country == "USA (USAJobs)":
+            location = st.text_input(
+                "📍 Location",
+                placeholder="e.g., Washington, DC or Remote",
+                key="search_location",
+            )
+        else:
+            location = st.text_input(
+                "📍 Location",
+                placeholder="e.g., Bangalore, Mumbai, Hyderabad, Delhi, Remote",
+                key="search_location_india",
+            )
     with col3:
         num_results = st.selectbox(
             "📊 Results",
@@ -393,27 +500,51 @@ if st.session_state.page == "search":
             key="num_results",
         )
 
-    search_btn = st.button("🚀 Search USAJobs", type="primary", use_container_width=True, key="search_btn")
+    if job_country == "USA (USAJobs)":
+        search_btn = st.button("🚀 Search USAJobs", type="primary", use_container_width=True, key="search_btn")
+    else:
+        search_btn = st.button("🚀 Search Indian Jobs", type="primary", use_container_width=True, key="search_btn_india")
 
     if search_btn:
         if not keyword.strip():
             st.warning("Please enter a search keyword.")
-        elif Config.validate():
-            st.error("Please configure your API keys first (see sidebar).")
+        elif job_country == "USA (USAJobs)":
+            if Config.validate():
+                st.error("Please configure your USAJobs API keys first (see sidebar).")
+            else:
+                with st.spinner("🔍 Fetching jobs from USAJobs.gov..."):
+                    try:
+                        client = USAJobsClient()
+                        jobs, total = client.fetch_and_parse(
+                            keyword=keyword.strip(),
+                            location=location.strip() if 'location' in locals() else "",
+                            results_per_page=num_results,
+                        )
+                        st.session_state.jobs = jobs
+                        st.session_state.total_jobs = total
+                        st.success(f"✅ Found **{total}** jobs! Showing top {len(jobs)} results.")
+                    except Exception as e:
+                        st.error(f"❌ API Error: {str(e)}")
         else:
-            with st.spinner("🔍 Fetching jobs from USAJobs.gov..."):
-                try:
-                    client = USAJobsClient()
-                    jobs, total = client.fetch_and_parse(
-                        keyword=keyword.strip(),
-                        location=location.strip(),
-                        results_per_page=num_results,
-                    )
-                    st.session_state.jobs = jobs
-                    st.session_state.total_jobs = total
-                    st.success(f"✅ Found **{total}** jobs! Showing top {len(jobs)} results.")
-                except Exception as e:
-                    st.error(f"❌ API Error: {str(e)}")
+            missing_ind = Config.validate_indian()
+            if missing_ind:
+                st.error(f"Please configure Indian job API keys for {Config.INDIAN_JOB_PROVIDER}: {', '.join(missing_ind)}")
+            else:
+                with st.spinner(f"🔍 Fetching jobs from India ({Config.INDIAN_JOB_PROVIDER})..."):
+                    try:
+                        client = IndianJobsClient()
+                        loc_val = location.strip() if 'location' in locals() else ""
+                        jobs, total = client.fetch_and_parse(
+                            keyword=keyword.strip(),
+                            location=loc_val,
+                            results_per_page=num_results,
+                        )
+                        st.session_state.jobs = jobs
+                        st.session_state.total_jobs = total
+                        source_note = f" via {Config.INDIAN_JOB_PROVIDER}"
+                        st.success(f"✅ Found **{total}** jobs! Showing top {len(jobs)} results{source_note}.")
+                    except Exception as e:
+                        st.error(f"❌ API Error: {str(e)}")
 
     # Display results
     if st.session_state.jobs:
@@ -469,7 +600,72 @@ if st.session_state.page == "search":
                     st.rerun()
             with col_link:
                 if job.get("url") and job["url"] != "N/A":
-                    st.link_button("🔗 View on USAJobs", job["url"], use_container_width=True)
+                    source_name = job.get("source", "Job Board")
+                    btn_label = f"🔗 View Job ({source_name.title()})"
+                    st.link_button(btn_label, job["url"], use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════
+# PAGE: Resume Review
+# ═════════════════════════════════════════════════════════
+elif st.session_state.page == "review":
+    st.markdown('<div class="section-header">🧾 AI Resume Review & Improvement Suggestions</div>', unsafe_allow_html=True)
+    st.caption("Get an honest audit of your resume - structure, ATS-friendliness, bullet impact, and prioritized fixes.")
+
+    resume_text_review = st.session_state.get("resume_uploaded_text", "") or st.session_state.get("user_resume", "")
+    job_ctx = st.session_state.get("selected_job")
+
+    if not resume_text_review.strip():
+        st.warning("📝 Please upload or paste your resume in the sidebar first.")
+    else:
+        col_r1, col_r2 = st.columns([2, 1])
+        with col_r1:
+            st.info(f"Resume loaded ({len(resume_text_review)} characters).")
+        with col_r2:
+            if job_ctx:
+                st.success(f"Using context: {job_ctx.get('title', 'Selected Job')}")
+            else:
+                st.caption("No job selected - reviewing against general best practices.")
+
+        review_btn = st.button(
+            "🚀 Run AI Resume Review",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.get("is_running", False),
+            key="resume_review_btn",
+        )
+
+        if review_btn:
+            if Config.validate():
+                st.error(f"🔑 Missing API keys: {', '.join(Config.validate())}")
+            else:
+                st.session_state.is_running = True
+                try:
+                    with st.spinner("🧠 Analyzing your resume with the Resume Auditor agent..."):
+                        review_out = run_resume_review_crew(
+                            user_resume_text=resume_text_review.strip(),
+                            job_data=job_ctx if job_ctx else None,
+                        )
+                        st.session_state.resume_review_output = review_out.get("review", review_out.get("full_output", ""))
+                    st.success("✅ Resume review complete!")
+                except Exception as e:
+                    st.error(f"❌ Error during resume review: {str(e)}")
+                    st.code(traceback.format_exc())
+                finally:
+                    st.session_state.is_running = False
+
+        if st.session_state.resume_review_output:
+            st.markdown('<div class="section-header">📊 Review Results</div>', unsafe_allow_html=True)
+            st.markdown('<div class="output-section">', unsafe_allow_html=True)
+            st.markdown(st.session_state.resume_review_output)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.download_button(
+                "⬇️ Download Resume Review Report",
+                st.session_state.resume_review_output,
+                file_name="resume_review_report.md",
+                mime="text/markdown",
+                key="dl_resume_review",
+            )
 
 
 # ═════════════════════════════════════════════════════════
@@ -540,11 +736,11 @@ elif st.session_state.page == "generate":
         st.markdown("---")
 
         # Pre-flight checks
-        resume_text = st.session_state.get("user_resume", "").strip()
+        resume_text = (st.session_state.get("resume_uploaded_text", "") or st.session_state.get("user_resume", "")).strip()
         can_run = True
 
         if not resume_text:
-            st.warning("📝 Please paste your resume in the sidebar before generating materials.")
+            st.warning("📝 Please upload or paste your resume in the sidebar before generating materials.")
             can_run = False
 
         if Config.validate():
@@ -586,19 +782,21 @@ elif st.session_state.page == "generate":
                     </div>
                     """, unsafe_allow_html=True)
 
-                    progress_bar = st.progress(0, text="🔬 Agent 1/3: Analyzing job description...")
+                    progress_bar = st.progress(0, text="Starting pipeline...")
+
+                    def _update_progress(step: int, total_steps: int, label: str) -> None:
+                        pct = max(5, min(int((step / max(total_steps, 1)) * 100), 100))
+                        progress_bar.progress(pct, text=f"Step {step}/{total_steps}: {label}")
 
                     try:
-                        # Run the crew
-                        progress_bar.progress(10, text="🔬 Agent 1/3: Analyzing job description...")
-
                         outputs = run_job_application_crew(
                             job_data=job,
                             user_resume=resume_text,
+                            progress_callback=_update_progress,
                         )
 
-                        progress_bar.progress(100, text="✅ All agents completed!")
-                        time.sleep(0.5)
+                        progress_bar.progress(100, text="✅ All steps completed!")
+                        time.sleep(0.3)
 
                         st.session_state.crew_output = outputs
 
